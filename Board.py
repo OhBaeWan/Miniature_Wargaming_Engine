@@ -27,8 +27,9 @@ class Board:
     def __init__(self, sizex: float, sizey: float):
         self.sizex = sizex
         self.sizey = sizey
-        self.board = [[Tile(self ,i, j, True) for i in range(sizex * TILES_PER_INCH)] for j in range(sizey * TILES_PER_INCH)]
+        self.board : list[list[Tile]] = [[Tile(self ,i, j, True) for i in range(sizex * TILES_PER_INCH)] for j in range(sizey * TILES_PER_INCH)]
         self.models : list[Model] = []
+        self.model_id_counter = 0
 
         
 
@@ -50,15 +51,23 @@ class Board:
 
         self.glfw = None
 
+        self.pathfinders : list[Pathfinder] = []
+
+
+
 
         
 
     
     def add_model(self, radius: float, x: int, y: int):
-        model = Model(self, radius, x, y)
+        model = Model(self, self.model_id_counter, radius, x, y)
         self.models.append(model)
+        self.model_id_counter += 1
+        self.clear_reachable_tiles()
     
     def update(self):
+
+        update_tiles = False
         # draw the board as a grid offset from the cursor position
         # find the right amount of pixels per tile to fit the board in the window
 
@@ -70,12 +79,14 @@ class Board:
         imgui.text("FPS: {:.2f}".format(1/imgui.get_io().delta_time))
         # total time
         imgui.text("Total time: {:.4f}".format(time.time() - self.start_time))
+        # pathfinding update time
+        imgui.text("Pathfinding update time: {:.4f}".format(self.pathfinding_time - self.start_time))
         # tile update time 
-        imgui.text("Tile update time: {:.4f}".format(self.tile_time - self.start_time))
+        imgui.text("Tile update time: {:.4f}".format(self.tile_time - self.pathfinding_time))
         # model update time
         imgui.text("Model update time: {:.4f}".format(self.model_time - self.tile_time))
-        # pathfinding update time
-        imgui.text("Pathfinding update time: {:.4f}".format(self.pathfinding_time - self.model_time))
+        # extra time
+        imgui.text("Extra time: {:.4f}".format(time.time() - self.model_time))
 
         self.start_time = time.time()
 
@@ -87,14 +98,20 @@ class Board:
         if new_window_size.x != self.window_size.x or new_window_size.y != self.window_size.y:
             self.window_size = new_window_size
             self.pixels_per_tile = min(self.window_size.x / self.view_port_size.x, self.window_size.y / self.view_port_size.y)
-        
-        self.ImageRgb = np.zeros((int(self.sizey * TILES_PER_INCH * self.pixels_per_tile), int(self.sizex * TILES_PER_INCH * self.pixels_per_tile), 3), np.uint8)
+            self.ImageRgb = np.zeros((int(self.sizey * TILES_PER_INCH * self.pixels_per_tile), int(self.sizex * TILES_PER_INCH * self.pixels_per_tile), 3), np.uint8)
+            update_tiles = True
 
         cursor_pos = imgui.get_cursor_pos()
         
-        for row in self.board:
-            for tile in row:
-                tile.update(cursor_pos, self.pixels_per_tile)
+        # update the pathfinding for all models
+        for pathfinder in self.pathfinders:
+            if pathfinder.update_pathfinding(cursor_pos):
+                update_tiles = True
+
+        self.pathfinding_time = time.time()
+        
+        if update_tiles:
+            self.update_tiles(cursor_pos)
         
         immvision.image(
         "##Original", self.ImageRgb, immvision.ImageParams(show_zoom_buttons=False, show_pixel_info=False, show_options_button=False, can_resize=False, refresh_image=True))
@@ -103,77 +120,61 @@ class Board:
 
 
         for model in self.models:
-            state, x, y = model.update(cursor_pos, not self.pathfinding_done)
+            state, x, y = model.update(cursor_pos)
 
             if state == ModelState.PICKED_UP:
-                self.clear_reachable_tiles()
-                self.setup_pathfinding(x, y, model.speed, model.radius)
-                self.pathfinding_done = False
+                pathfinder_found = False
+                for pathfinder in self.pathfinders:
+                    if pathfinder.model.id == model.id:
+                        pathfinder.setup_pathfinding()
+                        pathfinder_found = True
+                        break
+                if not pathfinder_found:
+                    pathfinder = Pathfinder(self, model)
+                    self.pathfinders.append(pathfinder)
+                    pathfinder.setup_pathfinding()
                 break
             elif state == ModelState.PLACED:
+                # clear the pathfinding for the model
+                for pathfinder in self.pathfinders:
+                    if pathfinder.model.id == model.id:
+                        self.pathfinders.remove(pathfinder)
+                        break
                 self.clear_reachable_tiles()
+                # restart the pathfinding for all models
+                for pathfinder in self.pathfinders:
+                    pathfinder.setup_pathfinding()
+                break
+            elif state == ModelState.INSPECTED:
+                pathfinder_found = False
+                for pathfinder in self.pathfinders:
+                    if pathfinder.model.id == model.id:
+                        pathfinder.setup_pathfinding()
+                        pathfinder_found = True
+                        break
+                if not pathfinder_found:
+                    pathfinder = Pathfinder(self, model)
+                    self.pathfinders.append(pathfinder)
+                    pathfinder.setup_pathfinding()
+                break
+            elif state == ModelState.UNINSPECTED:
+                # clear the pathfinding for the model
+                for pathfinder in self.pathfinders:
+                    if pathfinder.model.id == model.id:
+                        self.pathfinders.remove(pathfinder)
+                        break
+                self.clear_reachable_tiles()
+                # restart the pathfinding for all models
+                for pathfinder in self.pathfinders:
+                    pathfinder.setup_pathfinding()
                 break
         
         self.model_time = time.time()
         
-        self.update_pathfinding(cursor_pos)
-
-        self.pathfinding_time = time.time()
-
-
-        
         # set the cursor position to the row after the end of the board
         imgui.set_cursor_pos(imgui.ImVec2(cursor_pos.x + self.sizex * TILES_PER_INCH * self.pixels_per_tile, cursor_pos.y + self.sizey * TILES_PER_INCH * self.pixels_per_tile))
 
-
-    def setup_pathfinding(self, x: int, y: int, speed: int, radius: int):
-        # a flood fill pathfinding, that gets the neightbors of the current tile and checks if they are reachable and stores the distance from the start tile
-        # then the neighbors of the neighbors are checked and so on until the distance is greater than the speed of the model
-        self.x = x
-        self.y = y
-        print(f"setting up pathfinding at {x}, {y}")
-        # speed adjusted to radius of the model
-        self.speed = speed + radius
-        self.open_list = []
-        self.board[y][x].is_reachable = True
-
-        #self.open_list.append((x, y, 0))
-        # add the neighbors of the start tile to the open list
-        for neighbor, distance in self.get_neighbors(x, y):
-            if neighbor.is_walkable:
-                self.open_list.append((neighbor.x, neighbor.y, distance))
-
-        self.pathfinding_setup = True
-        self.pathfinding_done = False
-        
-    
-    def update_pathfinding(self, cursor_pos):
-        if not self.pathfinding_done and self.pathfinding_setup:
-            start_time = time.time()
-            while len(self.open_list) > 0:
-                x, y, distance = self.open_list.pop(0)
-                if distance < self.speed:
-                    self.board[y][x].is_reachable = True
-                    for neighbor, neighbor_distance in self.get_neighbors(x, y):
-                        if neighbor.is_walkable:
-                            # check if the neighbor is reachable and  if so update the distance and readd the neighbor to the open list
-                            if neighbor.distance == None:
-                                neighbor.distance = distance + neighbor_distance
-                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
-                            elif distance + neighbor_distance < neighbor.distance:
-                                neighbor.distance = distance + neighbor_distance
-                                neighbor.edge = False
-                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
-                else:
-                    self.board[y][x].edge = True
-                if time.time() - start_time > 0.01:
-                    break
-            if len(self.open_list) == 0:
-                self.pathfinding_done = True    
-        if self.pathfinding_setup:
-            # draw the speed of the model as a circle around the model
-            imgui.get_window_draw_list().add_circle(imgui.ImVec2(cursor_pos.x + self.x * self.pixels_per_tile, cursor_pos.y + self.y * self.pixels_per_tile), self.speed * self.pixels_per_tile, imgui.get_color_u32((0, 0, 255, 255)), num_segments=64)    
-    
+   
     def get_neighbors(self, x, y):
         neighbors = []
         if x > 0:
@@ -197,17 +198,27 @@ class Board:
 
         return neighbors
 
+    def update_tiles(self, cursor_pos):
+        for row in self.board:
+            for tile in row:
+                tile.update(cursor_pos, self.pixels_per_tile)
 
-    
     def clear_reachable_tiles(self):
         print("clearing reachable tiles")
         for row in self.board:
             for tile in row:
-                tile.is_reachable = False
-                tile.distance = None
-                tile.edge = False
-        self.pathfinding_setup = False
+                for key in tile.is_reachable:
+                    tile.is_reachable[key] = False
+                
+                for key in tile.distance:
+                    tile.distance[key] = None
+                
+                for key in tile.edge:
+                    tile.edge[key] = False
+
         self.ImageRgb = np.zeros((int(self.sizey * TILES_PER_INCH * self.pixels_per_tile), int(self.sizex * TILES_PER_INCH * self.pixels_per_tile), 3), np.uint8)
+
+
 
 
 # an enum representing the states of a model 
@@ -216,10 +227,13 @@ class ModelState:
     MOVING = 1
     PICKED_UP = 2
     PLACED = 3
+    INSPECTED = 4
+    UNINSPECTED = 5
 
 class Model: 
-    def __init__(self, board: Board, radius: float, x: int, y: int, speed: float = 12 ,color: tuple[int, int, int, int] = (255, 0, 0, 255)):
+    def __init__(self, board: Board, id: int, radius: float, x: int, y: int, speed: float = 12 ,color: tuple[int, int, int, int] = (255, 0, 0, 255)):
         # x and y are the center position of the model passed in inches, and stored in tiles, radius is the radius of the model passed in inches and stored in tiles
+        self.id = id
         self.radius = radius * TILES_PER_INCH
         self.x = x * TILES_PER_INCH
         self.y = y * TILES_PER_INCH
@@ -228,33 +242,32 @@ class Model:
         self.board = board
         self.moving = False
         self.placed = True
+        self.inspected = False
         self.last_mouse_pos = imgui.ImVec2(0, 0)
         self.color = color
         self.state = ModelState.IDLE
         self.check_valid_position(check_reachable=False)
         self.current_x = self.x
         self.current_y = self.y
+        self.placed_x = self.x
+        self.placed_y = self.y
         self.previous_delta = imgui.ImVec2(0, 0)
 
         
     
-    def update(self, cursor_pos, active_pathfinding: bool = False):
+    def update(self, cursor_pos):
 
-        
-        # if the mouse is hovering create a tooltip for the model with the x and y position
-        if imgui.is_mouse_hovering_rect(imgui.ImVec2(cursor_pos.x + self.x * self.board.pixels_per_tile - self.radius * self.board.pixels_per_tile, 
-                                                     cursor_pos.y + self.y * self.board.pixels_per_tile - self.radius * self.board.pixels_per_tile), 
-                                        imgui.ImVec2(cursor_pos.x + self.x * self.board.pixels_per_tile + self.radius * self.board.pixels_per_tile, 
-                                                     cursor_pos.y + self.y * self.board.pixels_per_tile + self.radius * self.board.pixels_per_tile)) or self.moving:
-            #imgui.begin_tooltip()
-            #imgui.text(f"x: {round(self.x, 1)} y: {round(self.y, 1)}")
-            #imgui.end_tooltip()
-            pass
-        elif imgui.is_mouse_clicked(0) and not self.placed:
+        # if the model is right clicked place the model
+        if imgui.is_mouse_clicked(1) and imgui.is_mouse_hovering_rect(imgui.ImVec2(cursor_pos.x + self.x * self.board.pixels_per_tile - self.radius * self.board.pixels_per_tile, 
+                                                                               cursor_pos.y + self.y * self.board.pixels_per_tile - self.radius * self.board.pixels_per_tile), 
+                                                                      imgui.ImVec2(cursor_pos.x + self.x * self.board.pixels_per_tile + self.radius * self.board.pixels_per_tile, 
+                                                                               cursor_pos.y + self.y * self.board.pixels_per_tile + self.radius * self.board.pixels_per_tile)) and not self.placed:
             self.state = ModelState.PLACED
             self.placed = True
+            self.placed_x = self.x
+            self.placed_y = self.y
+            self.inspected = False
             return (self.state, self.current_x, self.current_y)
-
         
         if self.moving:
             imgui.set_mouse_cursor(imgui.MouseCursor_.none)
@@ -312,6 +325,13 @@ class Model:
                 self.current_x = self.x
                 self.current_y = self.y
 
+                # if the hold time is greater than 0.1 seconds the model is picked up
+                if time.time() - self.hold_time_start < 0.1:
+                    if not self.inspected:
+                        self.state = ModelState.UNINSPECTED
+                else:
+                    self.inspected = True
+
                 # update the mouse position to the current position in pixels
                 glfw_utils.glfw.set_cursor_pos(self.board.glfw, cursor_pos.x + self.x * self.board.pixels_per_tile, cursor_pos.y + self.y * self.board.pixels_per_tile)
         else:
@@ -321,16 +341,23 @@ class Model:
                                                                                     cursor_pos.y + self.y * self.board.pixels_per_tile + self.radius * self.board.pixels_per_tile)):
                 
                 # set the cursor position to the center of the screen
+                self.hold_time_start = time.time()
                 imgui.set_mouse_cursor(imgui.MouseCursor_.none)
                 screen_center = imgui.ImVec2(cursor_pos.x + 2 * self.board.sizex * self.board.pixels_per_tile, cursor_pos.y + 2 * self.board.sizey * self.board.pixels_per_tile)
                 glfw_utils.glfw.set_cursor_pos(self.board.glfw, screen_center.x, screen_center.y)
                 self.moving = True
-                if self.placed and not active_pathfinding:
+                if self.placed:
                     self.state = ModelState.PICKED_UP
                     print(f"picking up model at {self.x}, {self.y}")
                     self.placed = False
+                    self.inspected = True
                 else:
-                    self.state = ModelState.MOVING
+                    if self.inspected:
+                        self.inspected = False
+                        self.state = ModelState.MOVING
+                    else:
+                        self.state = ModelState.INSPECTED
+                        self.inspected = True
             else:
                 self.state = ModelState.IDLE
 
@@ -343,8 +370,11 @@ class Model:
         imgui.get_window_draw_list().add_circle_filled(imgui.ImVec2(_x, _y), self.radius * self.board.pixels_per_tile, imgui.get_color_u32((255, 0, 0, 255)), num_segments=64)
 
         # draw text with the distance of the model from the start tile
-        if self.board.board[int(self.y)][int(self.x)].distance != None:
-            imgui.get_window_draw_list().add_text(imgui.ImVec2(_x - self.radius * self.board.pixels_per_tile / 2, _y - self.radius * self.board.pixels_per_tile / 2), imgui.get_color_u32((0, 0, 0, 255)), f"{round(self.board.board[int(self.y)][int(self.x)].distance / TILES_PER_INCH, 1)}")
+        try:
+            if self.board.board[int(self.y)][int(self.x)].distance[self.id] != None:
+                imgui.get_window_draw_list().add_text(imgui.ImVec2(_x - self.radius * self.board.pixels_per_tile / 2, _y - self.radius * self.board.pixels_per_tile / 2), imgui.get_color_u32((0, 0, 0, 255)), f"{round(self.board.board[int(self.y)][int(self.x)].distance[self.id] / TILES_PER_INCH, 1)}")
+        except:
+            pass
 
         return (self.state, self.current_x, self.current_y)
     
@@ -443,7 +473,7 @@ class Model:
     
     def check_reachable(self):
         # check if the current position of the model is reachable by checking the distance of the tile to the models speed - the radius of the model
-        if self.board.board[self.y][self.x].distance != None and self.board.board[self.y][self.x].distance < self.speed:
+        if self.board.board[self.y][self.x].distance[self.id] != None and self.board.board[self.y][self.x].distance[self.id] < self.speed:
             pass
         else:
             # if not find the closest reachable tile
@@ -451,7 +481,7 @@ class Model:
             closest_tile = None
             for row in self.board.board:
                 for tile in row:
-                    if tile.distance != None and tile.distance < self.speed:
+                    if tile.distance[self.id] != None and tile.distance[self.id] < self.speed:
                         distance = math.sqrt((self.x - tile.x) ** 2 + (self.y - tile.y) ** 2)
                         if closest_distance == None or distance < closest_distance:
                             closest_distance = distance
@@ -465,23 +495,99 @@ class Model:
             
             self.check_valid_position(check_reachable=False)
 
+
+class Pathfinder:
+    def __init__(self, board: Board, model: Model):
+        self.board = board
+        self.model = model
+        
+    def setup_pathfinding(self):
+        # a flood fill pathfinding, that gets the neightbors of the current tile and checks if they are reachable and stores the distance from the start tile
+        # then the neighbors of the neighbors are checked and so on until the distance is greater than the speed of the model
+        self.x = self.model.placed_x
+        self.y = self.model.placed_y
+        print(f"setting up pathfinding at {self.x}, {self.y}")
+        # speed adjusted to radius of the model
+        self.speed = self.model.speed + self.model.radius
+        self.open_list = []
+
+        self.board.board[self.y][self.x].set_reachable_state(self.model.id, True)
+        self.board.board[self.y][self.x].distance[self.model.id] = 0
+
+        # set the rest of the tiles to unreachable
+        for row in self.board.board:
+            for tile in row:
+                tile.set_reachable_state(self.model.id, False)
+                tile.distance[self.model.id] = None
+                tile.edge[self.model.id] = False
+        
+
+        #self.open_list.append((x, y, 0))
+        # add the neighbors of the start tile to the open list
+        for neighbor, distance in self.board.get_neighbors(self.x, self.y):
+            if neighbor.is_walkable:
+                self.open_list.append((neighbor.x, neighbor.y, distance))
+
+        self.pathfinding_setup = True
+        self.pathfinding_done = False
+    
+    def update_pathfinding(self, cursor_pos):
+        changed_tiles = False
+        if not self.pathfinding_done and self.pathfinding_setup:
+            start_time = time.time()
+            while len(self.open_list) > 0:
+                x, y, distance = self.open_list.pop(0)
+                if distance < self.speed:
+                    self.board.board[y][x].set_reachable_state(self.model.id, True)
+                    changed_tiles = True
+                    for neighbor, neighbor_distance in self.board.get_neighbors(x, y):
+                        if neighbor.is_walkable:
+                            # check if the neighbor is reachable and  if so update the distance and readd the neighbor to the open list
+                            if neighbor.distance[self.model.id] == None:
+                                neighbor.distance[self.model.id] = distance + neighbor_distance
+                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
+                            elif distance + neighbor_distance < neighbor.distance[self.model.id]:
+                                neighbor.distance[self.model.id] = distance + neighbor_distance
+                                neighbor.edge[self.model.id] = False
+                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
+                else:
+                    self.board.board[y][x].edge[self.model.id] = True
+                if time.time() - start_time > 0.01:
+                    break
+            if len(self.open_list) == 0:
+                self.pathfinding_done = True    
+        return changed_tiles
+
+
+
 class Tile:
-    def __init__(self, board: Board ,x: int, y: int, is_walkable: bool, is_reachable: bool = False ,color: tuple[int, int, int, int] = (128, 128, 128, 255)):
+    def __init__(self, board: Board ,x: int, y: int, is_walkable: bool, color: tuple[int, int, int, int] = (128, 128, 128, 255)):
         self.board = board
         self.x = x
         self.y = y
         self.is_walkable = is_walkable
-        self.is_reachable = is_reachable
-        self.could_be_reachable = False
-        self.edge = False
+        self.is_reachable = {int: bool}
+        self.is_any_reachable = False
+
+        self.edge = {int: bool}
         self.color = color
-        self.distance = None
+        self.distance = {int : float}
 
         self.already_clicked_without_break = False
+
+    def set_reachable_state(self, id: int, state: bool):
+        self.is_reachable[id] = state
+        if state:
+            self.is_any_reachable = True
+        elif not any(self.is_reachable.values()):
+            self.is_any_reachable = False
+    
+
     
     def update(self, cursor_pos, pixels_per_tile):
         # right click to change the walkable status of the tile
         
+        '''
         if imgui.is_mouse_down(1) and imgui.is_mouse_hovering_rect(imgui.ImVec2(cursor_pos.x + self.x * pixels_per_tile, cursor_pos.y + self.y * pixels_per_tile), imgui.ImVec2(cursor_pos.x + self.x * pixels_per_tile + pixels_per_tile, cursor_pos.y + self.y * pixels_per_tile + pixels_per_tile)):
             if not self.already_clicked_without_break:
                 self.already_clicked_without_break = True
@@ -489,15 +595,14 @@ class Tile:
                 # change the color of the tile to represent the walkable status
         else:
             self.already_clicked_without_break = False
-
+        '''
         
         if self.is_walkable:
-            if self.could_be_reachable:
-                self.color = (0, 255, 0, 255)
-            elif self.is_reachable:
+            # if any value in the is_reachable dictionary is true set the color to blue
+            if self.is_any_reachable:
                 self.color = (0, 0, 255, 255)
             else:
-                self.color = (255, 255, 255, 255)
+                self.color = (128, 128, 128, 255)
                 return
         else:
             self.color = (255, 0, 0, 255)
@@ -505,7 +610,8 @@ class Tile:
         _x = self.x * pixels_per_tile
         _y = self.y * pixels_per_tile
 
-        # draw the tile in board.ImageRgb
+        # draw the tile in board.ImageRgb if the color is not the same as the current color
+        
         self.board.ImageRgb[int(_y):int(_y + pixels_per_tile), int(_x):int(_x + pixels_per_tile)] = self.color[:3]
 
         #imgui.get_window_draw_list().add_rect_filled(imgui.ImVec2(_x, _y), imgui.ImVec2(_x + pixels_per_tile, _y + pixels_per_tile), imgui.get_color_u32(self.color))
