@@ -22,11 +22,12 @@ class GUI:
         # end the group
         imgui.end_group()
         imgui.same_line()
+        
         # start a group for the right side of the screen
         imgui.begin_group()
         imgui.text("Right Side")
         imgui.end_group()
-        
+
     
     def run(self):
         immapp.run(
