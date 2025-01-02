@@ -9,14 +9,24 @@ class GUI:
     def __init__(self):
         self.board = Board(64, 44)
         # create test models at each corner of the board with a radius of 1 inch
-        self.board.add_model(0.5, 0, 0)
+        self.board.add_model(2, 0, 0)
         self.board.add_model(0.5, 64, 0)
         self.board.add_model(0.5, 0, 44)
         self.board.add_model(0.5, 64, 44)
 
     def draw(self):
+        # start a group for the left side of the screen
+        imgui.begin_group()
         self.board.update()
         imgui.text("")
+        # end the group
+        imgui.end_group()
+        imgui.same_line()
+        # start a group for the right side of the screen
+        imgui.begin_group()
+        imgui.text("Right Side")
+        imgui.end_group()
+        
     
     def run(self):
         immapp.run(

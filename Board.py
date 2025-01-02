@@ -234,6 +234,7 @@ class Model:
         self.check_valid_position(check_reachable=False)
         self.current_x = self.x
         self.current_y = self.y
+        self.previous_delta = imgui.ImVec2(0, 0)
 
         
     
@@ -267,6 +268,13 @@ class Model:
 
             # calculate the delta of the mouse position from the center of the screen
             delta = current_mouse_pos - screen_center
+
+            # if the current delta is identical to the previous delta set the delta to 0
+            if delta == self.previous_delta:
+                delta = imgui.ImVec2(0, 0)
+            else:
+                self.previous_delta = delta
+
             # move the mouse back by a small amount to keep the cursor in the center of the screen
             glfw_utils.glfw.set_cursor_pos(self.board.glfw, screen_center.x, screen_center.y)
             
@@ -279,8 +287,8 @@ class Model:
                 angle = math.atan2(delta.y, delta.x)
                 delta = imgui.ImVec2(math.cos(angle) * self.radius * scaler, math.sin(angle) * self.radius * scaler)
  
-            self.x += 0.13 + delta.x / self.board.pixels_per_tile
-            self.y += 0.15 + delta.y / self.board.pixels_per_tile
+            self.x += delta.x / self.board.pixels_per_tile
+            self.y += delta.y / self.board.pixels_per_tile
 
             check, dir = self.check_collision()
             if check:
@@ -328,9 +336,9 @@ class Model:
 
 
 
-        # convert the x and y position to pixels and offset so that the center of the model is at the center of the tile at the x and y position
-        _x = cursor_pos.x + self.x * self.board.pixels_per_tile
-        _y = cursor_pos.y + self.y * self.board.pixels_per_tile 
+        # convert the x and y position to pixels
+        _x = cursor_pos.x   + self.x  * self.board.pixels_per_tile
+        _y = cursor_pos.y  + self.y  * self.board.pixels_per_tile
         
         imgui.get_window_draw_list().add_circle_filled(imgui.ImVec2(_x, _y), self.radius * self.board.pixels_per_tile, imgui.get_color_u32((255, 0, 0, 255)), num_segments=64)
 
@@ -380,10 +388,12 @@ class Model:
         for model in self.board.models:
             if model != self:
                 distance = math.sqrt((self.x - model.x) ** 2 + (self.y - model.y) ** 2)
-                if distance < self.radius * 2:
-                    out = True
-                    dir.append("X")
-                    dir.append("Y")
+                if distance < self.radius + model.radius:
+                    # if the model is colliding with another model move the model to the closest point where it is not colliding
+                    angle = math.atan2(self.y - model.y, self.x - model.x)
+                    self.x = model.x + math.cos(angle) * (self.radius + model.radius)
+                    self.y = model.y + math.sin(angle) * (self.radius + model.radius)
+
         
         
         return out, dir
@@ -391,6 +401,8 @@ class Model:
 
 
     def check_valid_position(self, check_reachable: bool = True):
+
+        # check if the model is colliding with the edge of the board
         if self.x - self.radius < 0:
             self.x = self.radius
         if self.x + self.radius > self.board.sizex * TILES_PER_INCH:
@@ -409,10 +421,25 @@ class Model:
                     angle = math.atan2(self.y - model.y, self.x - model.x)
                     self.x = model.x + math.cos(angle) * (self.radius + model.radius)
                     self.y = model.y + math.sin(angle) * (self.radius + model.radius)
+        
+
+        # check if the model is colliding with an unwalkable tile
+        for row in self.board.board:
+            for tile in row:
+                if not tile.is_walkable:
+                    distance = math.sqrt((self.x - tile.x) ** 2 + (self.y - tile.y) ** 2)
+                    if distance < self.radius:
+                        # if the model is colliding with an unwalkable tile move the model to the closest point where it is not colliding
+                        angle = math.atan2(self.y - tile.y, self.x - tile.x)
+                        self.x = tile.x + math.cos(angle) * self.radius
+                        self.y = tile.y + math.sin(angle) * self.radius
+        
         self.x = round(self.x)
         self.y = round(self.y)
+
         if check_reachable:
             self.check_reachable()
+        
     
     def check_reachable(self):
         # check if the current position of the model is reachable by checking the distance of the tile to the models speed - the radius of the model
