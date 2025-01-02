@@ -326,7 +326,7 @@ class Model:
                 self.current_y = self.y
 
                 # if the hold time is greater than 0.1 seconds the model is picked up
-                if time.time() - self.hold_time_start < 0.1:
+                if time.time() - self.hold_time_start < 0.2:
                     if not self.inspected:
                         self.state = ModelState.UNINSPECTED
                 else:
