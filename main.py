@@ -1,7 +1,7 @@
 from imgui_bundle import imgui, immapp
 from imgui_bundle import glfw_utils
 
-from Board import Board
+from Board import Gui_Board
 
 import time
 
@@ -9,7 +9,7 @@ TILES_PER_INCH = 5
 
 class GUI:
     def __init__(self):
-        self.board = Board(64, 44)
+        self.board = Gui_Board(64, 44)
         # create test models at each corner of the board with a radius of 1 inch
         self.board.add_model(2, 0, 0)
         self.board.add_model(0.5, 64, 0)
@@ -62,6 +62,7 @@ class GUI:
         # start a group for the left side of the screen
         imgui.begin_group()
         self.board.update()
+
         imgui.text("")
         # end the group
         imgui.end_group()
@@ -80,11 +81,16 @@ class GUI:
             window_size_auto=True,  # Auto size the application window given its widgets
             # Uncomment the next line to restore window position and size from previous run
             window_restore_previous_geometry=True,
-            fps_idle=60,  # The maximum frame rate when the window is not active
+            fps_idle=144,  # The maximum frame rate when the window is not active
         )
+
+    
+    def shutdown(self):
+        self.board.shutdown()
         
 
 
 if __name__ == "__main__":
     gui = GUI()
     gui.run()
+    gui.shutdown()

@@ -18,29 +18,174 @@ import cv2  # type: ignore
 import math
 from imgui_bundle import immvision
 import threading
+from multiprocessing import Process, Queue
+
+
 
 TILES_PER_INCH = 5
 
 immvision.use_rgb_color_order()
 
+
 class Board:
-    # board class size in inches, 10 tiles for every 1 inch
     def __init__(self, sizex: float, sizey: float):
         self.sizex = sizex
         self.sizey = sizey
-        self.board : list[list[Tile]] = [[Tile(self ,i, j, True) for i in range(sizex * TILES_PER_INCH)] for j in range(sizey * TILES_PER_INCH)]
-        self.models : list[Model] = []
-        self.model_id_counter = 0
 
+    def get_neighbors(self, x, y):
+        neighbors = []
+        if x > 0:
+            neighbors.append((self.board[y][x - 1], 1))
+        if x < self.sizex * TILES_PER_INCH - 1:
+            neighbors.append((self.board[y][x + 1], 1))
+        if y > 0:
+            neighbors.append((self.board[y - 1][x], 1))
+        if y < self.sizey * TILES_PER_INCH - 1:
+            neighbors.append((self.board[y + 1][x], 1))
         
+        # check diagonals
+        if x > 0 and y > 0:
+            neighbors.append((self.board[y - 1][x - 1], math.sqrt(2)))
+        if x < self.sizex * TILES_PER_INCH - 1 and y > 0:
+            neighbors.append((self.board[y - 1][x + 1], math.sqrt(2)))
+        if x > 0 and y < self.sizey * TILES_PER_INCH - 1:
+            neighbors.append((self.board[y + 1][x - 1], math.sqrt(2)))
+        if x < self.sizex * TILES_PER_INCH - 1 and y < self.sizey * TILES_PER_INCH - 1:
+            neighbors.append((self.board[y + 1][x + 1], math.sqrt(2)))
+
+        return neighbors
+
+
+class p_Board(Board):
+    def __init__(self, sizex: float, sizey: float, tile_queue: Queue, model_queue: Queue, pathfinder_queue: Queue, tile_return_queue: Queue, pathfinder_return_queue: Queue):
+        super().__init__(sizex, sizey)
+
+        self.tile_queue = tile_queue
+        self.model_queue = model_queue
+        self.pathfinder_queue = pathfinder_queue
+        self.tile_return_queue = tile_return_queue
+        self.pathfinder_return_queue = pathfinder_return_queue
+
+        self.tiles_need_update = False
+
+        self.board : list[list[p_Tile_wrapper]] = [[p_Tile_wrapper(p_Tile(i, j, True)) for i in range(sizex * TILES_PER_INCH)] for j in range(sizey * TILES_PER_INCH)]
+        self.pathfinders : list[Pathfinder] = []
+        self.models : list[Model] = []
+
+        self.current_pathfinder = 0
+        print("Process board started")
+        self.update()  
+
+    def update(self):
+
+        print("Starting update")
+        while(True):
+            # update the tiles from the tile queue
+            while not self.tile_queue.empty():
+                tile = self.tile_queue.get()
+                self.board[tile.y][tile.x].tile = tile
+            
+            # update the models from the model queue
+            while not self.model_queue.empty():
+                model = self.model_queue.get()
+                # if the model is already in the list update the model otherwise add the model to the list
+                model_found = False
+                for i, m in enumerate(self.models):
+                    if m.id == model[0]:
+                        self.models[i].radius = model[1]
+                        self.models[i].x = model[2]
+                        self.models[i].y = model[3]
+                        self.models[i].current_x = model[4]
+                        self.models[i].current_y = model[5]
+                        self.models[i].placed_x = model[6]
+                        self.models[i].placed_y = model[7]
+                        self.models[i].speed = model[8]
+                        self.models[i].inspected = model[9]
+                        self.models[i].show_vision = model[10]
+                        self.models[i].vision_range = model[11]
+
+
+                        model_found = True
+                if not model_found:
+                    model_obj = Model(self, model[0], model[1], model[2], model[3], model[8], (255, 0, 0, 255))
+                    model_obj.current_x = model[4]
+                    model_obj.current_y = model[5]
+                    model_obj.placed_x = model[6]
+                    model_obj.placed_y = model[7]
+                    model_obj.inspected = model[9]
+                    model_obj.show_vision = model[10]
+                    model_obj.vision_range = model[11]
+                    self.models.append(model_obj)
+                    # add the model to each tile 
+
+
+            # update the pathfinders from the pathfinder queue, pathfinders are sent in a tuple with the pathfinder type, model id, and a bool to determine if the pathfinder should be removed
+            while not self.pathfinder_queue.empty():
+                pathfinder = self.pathfinder_queue.get()
+                if pathfinder[2]:
+                    for i, p in enumerate(self.pathfinders):
+                        if p.model.id == pathfinder[1]:
+                            self.pathfinders.pop(i)
+                else:
+                    # if the pathfinder is already in the list update the pathfinder otherwise add the pathfinder to the list
+                    pathfinder_found = False
+                    for i, p in enumerate(self.pathfinders):
+                        if p.model.id == pathfinder[1]:
+                            self.pathfinders[i].requires_setup = True
+                            pathfinder_found = True 
+                    if not pathfinder_found:
+                        if pathfinder[0] == "moving":
+                            movement_pathfinder = moving_Pathfinder(self, self.models[pathfinder[1]])
+                            self.pathfinders.append(movement_pathfinder)
+                            movement_pathfinder.setup_pathfinding()
+                        elif pathfinder[0] == "vision":
+                            vision_pathfinder = vision_Pathfinder(self, self.models[pathfinder[1]])
+                            self.pathfinders.append(vision_pathfinder)
+                            vision_pathfinder.setup_pathfinding()
+            
+            # update the pathfinding for all models
+            # update the pathfinding for all models
+            if len(self.pathfinders) > 0:
+                time_per_pathfinder = 0.04 / len(self.pathfinders)
+            else:
+                time_per_pathfinder = 0.04
+            for i, pathfinder in enumerate(self.pathfinders[self.current_pathfinder:]):
+                if pathfinder.update_pathfinding(time_per_pathfinder):
+                    self.current_pathfinder = i  
+                
+                if pathfinder.pathfinding_done:
+                    self.pathfinder_return_queue.put((pathfinder.model.id, pathfinder.pathfinding_type, pathfinder.tiles))
+            
+            self.current_pathfinder = 0
+
+            
+            # send the updated tiles to the tile return queue
+            for row in self.board:
+                for tile in row:
+                    if tile.tile.updated:
+                        self.tile_return_queue.put(tile.tile)
+                        tile.tile.updated = False
+
+
+
+class Gui_Board(Board):
+    # board class size in inches, 10 tiles for every 1 inch
+    def __init__(self, sizex: float, sizey: float):
+        super().__init__(sizex, sizey)
+
+        self.board : list[list[Tile]] = [[Tile(self ,i, j, True) for i in range(sizex * TILES_PER_INCH)] for j in range(sizey * TILES_PER_INCH)]
+        
+        
+        self.models : list[Model] = []
+        self.unwalkable_tiles = []
+        self.model_id_counter = 0
 
         self.pathfinding_done = True
         self.pathfinding_setup = False
 
         self.view_port_origin = imgui.ImVec2(0, 0)
         self.view_port_size = imgui.ImVec2(sizex * TILES_PER_INCH, sizey * TILES_PER_INCH)
-
-        # find the right amount of pixels per tile to fit the board in the window
+        # passd the right amount of pixels per tile to fit the board in the window
         self.window_size = imgui.ImVec2(800, 600)
         self.pixels_per_tile = min(self.window_size.x / self.view_port_size.x, self.window_size.y / self.view_port_size.y)
         self.ImageRgb = np.zeros((int(sizey * TILES_PER_INCH * self.pixels_per_tile), int(sizex * TILES_PER_INCH * self.pixels_per_tile), 3), np.uint8)
@@ -49,6 +194,7 @@ class Board:
         self.start_time = 0
         self.tile_time = 0
         self.model_time = 0
+        self.render_time = 0
         self.pathfinding_time = 0
 
         self.glfw = None
@@ -69,14 +215,32 @@ class Board:
 
         self.current_pathfinder = 0
 
+        self.refresh_display = False
+
+        # queue for sending tiles to the update process
+        self.tile_queue = Queue()
+
+        # queue for sending models to the update process
+        self.model_queue = Queue()
+
+        # queue for sending pathfinders to the update process
+        self.pathfinder_queue = Queue()
+
+        # queue for receiveing tiles from the update process
+        self.tile_return_queue = Queue()
+
+        # queue for receiving pathfinders from the update process
+        self.pathfinder_return_queue = Queue()
+
+
         #self.tile_update_thread_active = True
 
         #self.tile_update_thread = threading.Thread(target=self.update_tiles_thread)
         #self.tile_update_thread.start()
 
+        self.process_board = Process(target=p_Board, args=(self.sizex, self.sizey, self.tile_queue, self.model_queue, self.pathfinder_queue, self.tile_return_queue, self.pathfinder_return_queue))
 
-
-
+        #self.process_board.start()
 
 
 
@@ -94,14 +258,16 @@ class Board:
         startx = int(startx)
         starty = int(starty)
         
-
-        
         for y in range(len(terrain)):
             for x in range(len(terrain[y])):
                 # if the tile is already unwalkable leave it alone otherwise set the tile to the value in the terrain array
-                if not self.board[y + starty][x + startx].is_walkable:
+                if not self.board[y + starty][x + startx].tile.is_walkable:
                     continue
-                self.board[y + starty][x + startx].is_walkable = terrain[y][x]
+                self.board[y + starty][x + startx].tile.is_walkable = terrain[y][x]
+
+                # if the tile is unwalkable add it to the list of unwalkable tiles
+                if not terrain[y][x]:
+                    self.unwalkable_tiles.append(self.board[y + starty][x + startx])
 
     # static method to create a corner terrain shape
     @staticmethod
@@ -140,19 +306,18 @@ class Board:
     
     def add_model(self, radius: float, x: int, y: int):
         model = Model(self, self.model_id_counter, radius, x, y)
+
         self.models.append(model)
         self.model_id_counter += 1
         self.clear_reachable_tiles()
 
-    def update_tiles_thread(self):
-        while(self.tile_update_thread_active):
-            if self.update_tiles():
-                self.tile_update_counter = (0, 0)
-                self.tiles_need_update = False
-                print("tiles updated in ", time.time() - self.last_tile_update)
-                self.last_tile_update = time.time()
-                self._ImageRgb = self.ImageRgb.copy()
-
+            
+    def shutdown(self):
+        try:
+            self.process_board.terminate()
+            self.process_board.join()
+        except:
+            pass
     
     def update(self):
 
@@ -171,8 +336,10 @@ class Board:
         imgui.text("Pathfinding update time: {:.4f}".format(self.pathfinding_time - self.start_time))
         # tile update time 
         imgui.text("Tile update time: {:.4f}".format(self.tile_time - self.pathfinding_time))
+        # render time
+        imgui.text("Render time: {:.4f}".format(self.render_time - self.tile_time))
         # model update time
-        imgui.text("Model update time: {:.4f}".format(self.model_time - self.tile_time))
+        imgui.text("Model update time: {:.4f}".format(self.model_time - self.render_time))
         # extra time
         imgui.text("Extra time: {:.4f}".format(time.time() - self.model_time))
 
@@ -192,7 +359,8 @@ class Board:
             #self.tile_update_counter = (0, 0)
 
         cursor_pos = imgui.get_cursor_pos()
-        
+
+              
         # update the pathfinding for all models
         if len(self.pathfinders) > 0:
             time_per_pathfinder = 0.04 / len(self.pathfinders)
@@ -201,9 +369,42 @@ class Board:
 
         pathfinding_done = True
         for i, pathfinder in enumerate(self.pathfinders):
-            pathfinder.update_pathfinding(cursor_pos, time_per_pathfinder)
+            pathfinder.update_pathfinding(time_per_pathfinder)
+
+        '''
+        # send the updated tiles to the tile queue
+        for row in self.board:
+            for tile in row:
+                if tile.tile.updated:
+                    self.tile_queue.put(tile.tile)
+                    tile.tile.updated = False
+        
+        # get the updated tiles from the tile return queue
+        while not self.tile_return_queue.empty():
+            tile = self.tile_return_queue.get()
+            self.board[tile.y][tile.x].tile = tile
+
+        # send the models to the model queue
+        for model in self.models:
+            if model.updated:
+                # send the model id, radius, x, y, current_x, current_y, placed_x, placed_y and speed to the model queue
+                cmd = (model.id, model.radius, model.x, model.y, model.current_x, model.current_y, model.placed_x, model.placed_y, model.speed, model.inspected, model.show_vision, model.vision_range)
+                self.model_queue.put(cmd)
+                model.updated = False
+
+        # get the updated pathfinders from the pathfinder return queue
+        while not self.pathfinder_return_queue.empty():
+            pathfinder = self.pathfinder_return_queue.get()
+            for i, p in enumerate(self.pathfinders):
+                if p.model.id == pathfinder[0] and p.pathfinder_type == pathfinder[1]:
+                    self.pathfinders[i].tiles = pathfinder[2]
+                    self.pathfinders[i].requires_setup = False
+                    break
+        '''
 
         self.pathfinding_time = time.time()
+
+
 
 
         #if self.tiles_need_update:
@@ -215,14 +416,82 @@ class Board:
             print("tiles updated in ", time.time() - self.last_tile_update)
             self.last_tile_update = time.time()
             self._ImageRgb = self.ImageRgb.copy()
-
-        
-        immvision.image(
-        "##Original", self._ImageRgb, immvision.ImageParams(show_zoom_buttons=False, show_pixel_info=False, show_options_button=False, can_resize=False, refresh_image=True))
+            self.refresh_display = True
 
         self.tile_time = time.time()
 
+        
+        immvision.image(
+        "##Original", self._ImageRgb, immvision.ImageParams(show_zoom_buttons=False, show_pixel_info=False, show_options_button=False, can_resize=False, refresh_image=self.refresh_display))
 
+        self.refresh_display = False
+
+        self.render_time = time.time()
+
+        '''
+        for model in self.models:
+            state, x, y = model.update(cursor_pos)
+
+            if state == ModelState.PICKED_UP:
+                #if not self.tiles_need_update:
+                self.tiles_need_update = True
+                self.tile_update_counter = (0, 0)
+                # send the pathfinder details to the pathfinder queue
+                self.pathfinder_queue.put(("moving", model.id, False))
+                self.pathfinder_queue.put(("vision", model.id, False))
+                
+                break
+            elif state == ModelState.PLACED:
+                self.clear_reachable_tiles()
+                #if not self.tiles_need_update:
+                self.tiles_need_update = True
+                self.tile_update_counter = (0, 0)
+                self.pathfinder_queue.put(("moving", model.id, True))
+                self.pathfinder_queue.put(("vision", model.id, True))
+                # reapply the pathfinding for all models
+                for pathfinder in self.pathfinders:
+                    pathfinder.tiles_need_applied = True
+                break
+            elif state == ModelState.INSPECTED:
+                #if not self.tiles_need_update:
+                self.tiles_need_update = True
+                self.tile_update_counter = (0, 0)
+                self.pathfinder_queue.put(("moving", model.id, False))
+                self.pathfinder_queue.put(("vision", model.id, False))
+                break
+            elif state == ModelState.UNINSPECTED:
+                self.clear_reachable_tiles()
+                #if not self.tiles_need_update:
+                self.tiles_need_update = True
+                self.tile_update_counter = (0, 0)
+                # clear the pathfinding for the model
+                self.pathfinder_queue.put(("moving", model.id, True))
+                self.pathfinder_queue.put(("vision", model.id, True))
+                # restart the pathfinding for all models
+                for pathfinder in self.pathfinders:
+                    pathfinder.tiles_need_applied = True
+                break
+            elif state == ModelState.REFRESH:
+                self.clear_reachable_tiles()
+                #if not self.tiles_need_update:
+                self.tiles_need_update = True
+                self.tile_update_counter = (0, 0)
+                self.pathfinder_queue.put(("moving", model.id, False))
+                self.pathfinder_queue.put(("vision", model.id, False))
+                for pathfinder in self.pathfinders:
+                    pathfinder.tiles_need_applied = True
+                break
+            elif state == ModelState.LETGO:
+                self.clear_reachable_tiles()
+                #if not self.tiles_need_update:
+                self.tiles_need_update = True
+                self.tile_update_counter = (0, 0)
+                self.pathfinder_queue.put(("moving", model.id, False))
+                self.pathfinder_queue.put(("vision", model.id, False))
+                for pathfinder in self.pathfinders:
+                    pathfinder.tiles_need_applied = True
+                break
+            '''
         for model in self.models:
             state, x, y = model.update(cursor_pos)
 
@@ -330,28 +599,7 @@ class Board:
         imgui.set_cursor_pos(imgui.ImVec2(cursor_pos.x + self.sizex * TILES_PER_INCH * self.pixels_per_tile, cursor_pos.y + self.sizey * TILES_PER_INCH * self.pixels_per_tile))
 
    
-    def get_neighbors(self, x, y):
-        neighbors = []
-        if x > 0:
-            neighbors.append((self.board[y][x - 1], 1))
-        if x < self.sizex * TILES_PER_INCH - 1:
-            neighbors.append((self.board[y][x + 1], 1))
-        if y > 0:
-            neighbors.append((self.board[y - 1][x], 1))
-        if y < self.sizey * TILES_PER_INCH - 1:
-            neighbors.append((self.board[y + 1][x], 1))
-        
-        # check diagonals
-        if x > 0 and y > 0:
-            neighbors.append((self.board[y - 1][x - 1], math.sqrt(2)))
-        if x < self.sizex * TILES_PER_INCH - 1 and y > 0:
-            neighbors.append((self.board[y - 1][x + 1], math.sqrt(2)))
-        if x > 0 and y < self.sizey * TILES_PER_INCH - 1:
-            neighbors.append((self.board[y + 1][x - 1], math.sqrt(2)))
-        if x < self.sizex * TILES_PER_INCH - 1 and y < self.sizey * TILES_PER_INCH - 1:
-            neighbors.append((self.board[y + 1][x + 1], math.sqrt(2)))
-
-        return neighbors
+    
 
     def update_tiles(self):
         start_time = time.time()
@@ -360,7 +608,7 @@ class Board:
             if i == 0:
                 for tile in row[self.tile_update_counter[1]:]:
                     tile.update(self.pixels_per_tile)
-                    if time.time() > start_time + 0.04:
+                    if time.time() > start_time + 0.005:
                         self.tile_update_counter = (i + self.tile_update_counter[0], j + self.tile_update_counter[1])
                         return False
             else:
@@ -379,6 +627,7 @@ class Board:
             for tile in row:
                 tile.needs_reset = True
 
+
         self.ImageRgb = np.zeros((int(self.sizey * TILES_PER_INCH * self.pixels_per_tile), int(self.sizex * TILES_PER_INCH * self.pixels_per_tile), 3), np.uint8)
 
 
@@ -395,6 +644,8 @@ class ModelState:
     UNINSPECTED = 5
     REFRESH = 6
     LETGO = 7
+
+
 
 class Model: 
     def __init__(self, board: Board, id: int, radius: float, x: int, y: int, speed: float = 12 ,color: tuple[int, int, int, int] = (255, 0, 0, 255)):
@@ -422,6 +673,8 @@ class Model:
         self.vision_range = 24 * TILES_PER_INCH
 
         self.show_vision = False
+
+        self.updated = True
 
         
     
@@ -475,6 +728,7 @@ class Model:
                 self.check_valid_position()
                 self.current_x = self.x
                 self.current_y = self.y
+                self.updated = True
 
                 # set the state to uninspected to update the pathfinding     
                 self.state = ModelState.REFRESH
@@ -487,6 +741,7 @@ class Model:
                 self.placed_x = self.x
                 self.placed_y = self.y
                 self.inspected = False
+                self.updated = True
                 imgui.end_popup()
                 return (self.state, self.current_x, self.current_y)
             imgui.end_popup()
@@ -548,7 +803,7 @@ class Model:
                 self.check_valid_position()
                 self.current_x = self.x
                 self.current_y = self.y
-
+                
                 # if the hold time is greater than 0.1 seconds the model is picked up
                 if time.time() - self.hold_time_start < 0.2:
                     if not self.inspected:
@@ -556,6 +811,7 @@ class Model:
                 else:
                     self.inspected = True
                     self.state = ModelState.LETGO
+                    self.updated = True
 
 
                 # update the mouse position to the current position in pixels
@@ -598,8 +854,8 @@ class Model:
 
         # draw text with the distance of the model from the start tile
         try:
-            if self.board.board[int(self.y)][int(self.x)].distance[self.id] != None:
-                imgui.get_window_draw_list().add_text(imgui.ImVec2(_x - self.radius * self.board.pixels_per_tile / 2, _y - self.radius * self.board.pixels_per_tile / 2), imgui.get_color_u32((0, 0, 0, 255)), f"{round(self.board.board[int(self.y)][int(self.x)].distance[self.id] / TILES_PER_INCH, 1)}")
+            if self.board.board[int(self.y)][int(self.x)].tile.distance[self.id] != None:
+                imgui.get_window_draw_list().add_text(imgui.ImVec2(_x - self.radius * self.board.pixels_per_tile / 2, _y - self.radius * self.board.pixels_per_tile / 2), imgui.get_color_u32((0, 0, 0, 255)), f"{round(self.board.board[int(self.y)][int(self.x)].tile.distance[self.id] / TILES_PER_INCH, 1)}")
         except:
             pass
 
@@ -631,6 +887,7 @@ class Model:
         # check if the model is colliding with an unwalkable tile
         for row in self.board.board:
             for tile in row:
+                tile = tile.tile
                 if not tile.is_walkable or tile.edge:
                     distance = math.sqrt((self.x - tile.x) ** 2 + (self.y - tile.y) ** 2)
                     if distance < self.radius:
@@ -683,6 +940,7 @@ class Model:
         # check if the model is colliding with an unwalkable tile
         for row in self.board.board:
             for tile in row:
+                tile = tile.tile
                 if not tile.is_walkable:
                     distance = math.sqrt((self.x - tile.x) ** 2 + (self.y - tile.y) ** 2)
                     if distance < self.radius:
@@ -702,13 +960,13 @@ class Model:
 
         # check if the current position of the model is reachable by checking the distance of the tile to the models speed - the radius of the model
         try:
-            if self.board.board[self.y][self.x].distance[self.id] == None:
+            if self.board.board[self.y][self.x].tile.distance[self.id] == None:
                 self.move_to_closest_valid() 
         except:
             self.move_to_closest_valid()
         
         try:
-            if self.board.board[self.y][self.x].distance[self.id] >= self.speed:
+            if self.board.board[self.y][self.x].tile.distance[self.id] >= self.speed:
                 # if not find the closest reachable tile
                 self.move_to_closest_valid()
         except:
@@ -751,7 +1009,7 @@ class Pathfinder:
         self.requires_setup = False
         return False
 
-    def update_pathfinding(self, cursor_pos, update_time):
+    def update_pathfinding(self, update_time):
         if self.requires_setup:
             if self.setup_pathfinding():
                 return True
@@ -769,13 +1027,10 @@ class Pathfinder:
         pass
 
 
-
-
-
-
 class vision_Pathfinder(Pathfinder):
     def __init__(self, board: Board, model: Model):
         super().__init__(board, model)
+        self.pathfinding_type = "vision"
 
     def setup_pathfinding(self):
         if super().setup_pathfinding():
@@ -799,12 +1054,12 @@ class vision_Pathfinder(Pathfinder):
         # set the rest of the tiles to unreachable
         for row in self.board.board:
             for tile in row:
-                tile.set_visible_state(self.model.id, False)
-                tile.visibility_distance[self.model.id] = None
+                tile.tile.set_visible_state(self.model.id, False)
+                tile.tile.visibility_distance[self.model.id] = None
 
 
-        self.board.board[self.y][self.x].set_visible_state(self.model.id, True)
-        self.board.board[self.y][self.x].visibility_distance[self.model.id] = 0
+        self.board.board[self.y][self.x].tile.set_visible_state(self.model.id, True)
+        self.board.board[self.y][self.x].tile.visibility_distance[self.model.id] = 0
 
         self.tiles.append((self.x, self.y, 0))
         
@@ -812,8 +1067,8 @@ class vision_Pathfinder(Pathfinder):
         #self.open_list.append((x, y, 0))
         # add the neighbors of the start tile to the open list
         for neighbor, distance in self.board.get_neighbors(self.x, self.y):
-            if neighbor.is_walkable:
-                self.open_list.append((neighbor.x, neighbor.y, distance))
+            if neighbor.tile.is_walkable:
+                self.open_list.append((neighbor.tile.x, neighbor.tile.y, distance))
 
         self.pathfinding_setup = True
         self.pathfinding_done = False
@@ -858,7 +1113,7 @@ class vision_Pathfinder(Pathfinder):
         model_y = self.model.current_y + offset_y
 
         if not skip:
-            angle = math.atan2(y - model_y, x - model_x) 
+            angle = math.atan2(y - model_y, x - model_x)
             distance = math.sqrt((x - model_x) ** 2 + (y - model_y) ** 2)
             good_path = True
             for k in range(1, int(distance)):
@@ -868,12 +1123,11 @@ class vision_Pathfinder(Pathfinder):
                 x2 = min(max(x2, 0), self.board.sizex * TILES_PER_INCH - 1)
                 y2 = min(max(y2, 0), self.board.sizey * TILES_PER_INCH - 1)
 
-                if not self.board.board[int(y2)][int(x2)].is_walkable:
+                if not self.board.board[int(y2)][int(x2)].tile.is_walkable:
                     good_path = False
                     break
             if good_path:
                 return True
-            
 
         offset_x = self.model.radius
         offset_y = 0
@@ -900,7 +1154,7 @@ class vision_Pathfinder(Pathfinder):
                 x2 = min(max(x2, 0), self.board.sizex * TILES_PER_INCH - 1)
                 y2 = min(max(y2, 0), self.board.sizey * TILES_PER_INCH - 1)
 
-                if not self.board.board[int(y2)][int(x2)].is_walkable:
+                if not self.board.board[int(y2)][int(x2)].tile.is_walkable:
                     good_path = False
                     break
             if good_path:
@@ -932,7 +1186,7 @@ class vision_Pathfinder(Pathfinder):
                 x2 = min(max(x2, 0), self.board.sizex * TILES_PER_INCH - 1)
                 y2 = min(max(y2, 0), self.board.sizey * TILES_PER_INCH - 1)
 
-                if not self.board.board[int(y2)][int(x2)].is_walkable:
+                if not self.board.board[int(y2)][int(x2)].tile.is_walkable:
                     good_path = False
                     break
             if good_path:
@@ -963,7 +1217,7 @@ class vision_Pathfinder(Pathfinder):
                 x2 = min(max(x2, 0), self.board.sizex * TILES_PER_INCH - 1)
                 y2 = min(max(y2, 0), self.board.sizey * TILES_PER_INCH - 1)
 
-                if not self.board.board[int(y2)][int(x2)].is_walkable:
+                if not self.board.board[int(y2)][int(x2)].tile.is_walkable:
                     good_path = False
                     break
             if good_path:
@@ -971,8 +1225,8 @@ class vision_Pathfinder(Pathfinder):
             
         return False
     
-    def update_pathfinding(self, cursor_pos, update_time):
-        if super().update_pathfinding(cursor_pos, update_time):
+    def update_pathfinding(self, update_time):
+        if super().update_pathfinding(update_time):
             return False
         
         if not self.model.show_vision:
@@ -985,18 +1239,18 @@ class vision_Pathfinder(Pathfinder):
                 x, y, distance = self.open_list.pop(0)
                 if distance < self.speed:
                     if self.is_visible(x, y):
-                        self.board.board[y][x].set_visible_state(self.model.id, True)
+                        self.board.board[y][x].tile.set_visible_state(self.model.id, True)
                         self.tiles.append((x, y, distance))
                     for neighbor, neighbor_distance in self.board.get_neighbors(x, y):
-                        if neighbor.is_walkable:
+                        if neighbor.tile.is_walkable:
                             # check if the neighbor is reachable and  if so update the distance and readd the neighbor to the open list
-                            if neighbor.visibility_distance[self.model.id] == None:
-                                neighbor.visibility_distance[self.model.id] = distance + neighbor_distance
-                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
-                            elif distance + neighbor_distance < neighbor.visibility_distance[self.model.id]:
-                                neighbor.visibility_distance[self.model.id] = distance + neighbor_distance
-                                neighbor.edge[self.model.id] = False
-                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
+                            if neighbor.tile.visibility_distance[self.model.id] == None:
+                                neighbor.tile.visibility_distance[self.model.id] = distance + neighbor_distance
+                                self.open_list.append((neighbor.tile.x, neighbor.tile.y, distance + neighbor_distance))
+                            elif distance + neighbor_distance < neighbor.tile.visibility_distance[self.model.id]:
+                                neighbor.tile.visibility_distance[self.model.id] = distance + neighbor_distance
+                                neighbor.tile.edge[self.model.id] = False
+                                self.open_list.append((neighbor.tile.x, neighbor.tile.y, distance + neighbor_distance))
                 if time.time() - start_time > update_time:
                     return True
             if len(self.open_list) == 0:
@@ -1012,8 +1266,8 @@ class vision_Pathfinder(Pathfinder):
             return True
 
         for tile in self.tiles:
-            self.board.board[tile[1]][tile[0]].set_visible_state(self.model.id, True)
-            self.board.board[tile[1]][tile[0]].visibility_distance[self.model.id] = tile[2]
+            self.board.board[tile[1]][tile[0]].tile.set_visible_state(self.model.id, True)
+            self.board.board[tile[1]][tile[0]].tile.visibility_distance[self.model.id] = tile[2]
         self.tiles_need_applied = False
         return False
     
@@ -1026,14 +1280,15 @@ class vision_Pathfinder(Pathfinder):
             return True
 
         for tile in self.tiles:
-            self.board.board[tile[1]][tile[0]].set_visible_state(self.model.id, False)
-            self.board.board[tile[1]][tile[0]].visibility_distance[self.model.id] = None
+            self.board.board[tile[1]][tile[0]].tile.set_visible_state(self.model.id, False)
+            self.board.board[tile[1]][tile[0]].tile.visibility_distance[self.model.id] = None
         self.tiles_need_applied = False
         return False
 
 
 class moving_Pathfinder(Pathfinder):
     def __init__(self, board: Board, model: Model):
+        self.pathfinding_type = "moving"
         super().__init__(board, model)
         
     def setup_pathfinding(self):
@@ -1054,13 +1309,14 @@ class moving_Pathfinder(Pathfinder):
         # set the rest of the tiles to unreachable
         for row in self.board.board:
             for tile in row:
+                tile = tile.tile
                 tile.set_reachable_state(self.model.id, False)
                 tile.distance[self.model.id] = None
                 tile.edge[self.model.id] = False
         
 
-        self.board.board[self.y][self.x].set_reachable_state(self.model.id, True)
-        self.board.board[self.y][self.x].distance[self.model.id] = 0
+        self.board.board[self.y][self.x].tile.set_reachable_state(self.model.id, True)
+        self.board.board[self.y][self.x].tile.distance[self.model.id] = 0
 
         self.tiles.append((self.x, self.y, 0))
         
@@ -1068,14 +1324,14 @@ class moving_Pathfinder(Pathfinder):
         #self.open_list.append((x, y, 0))
         # add the neighbors of the start tile to the open list
         for neighbor, distance in self.board.get_neighbors(self.x, self.y):
-            if neighbor.is_walkable:
-                self.open_list.append((neighbor.x, neighbor.y, distance))
+            if neighbor.tile.is_walkable:
+                self.open_list.append((neighbor.tile.x, neighbor.tile.y, distance))
 
         self.pathfinding_setup = True
         self.pathfinding_done = False
     
-    def update_pathfinding(self, cursor_pos, update_time):
-        if super().update_pathfinding(cursor_pos, update_time):
+    def update_pathfinding(self, update_time):
+        if super().update_pathfinding(update_time):
             return False
         changed_tiles = False
 
@@ -1085,21 +1341,21 @@ class moving_Pathfinder(Pathfinder):
             while len(self.open_list) > 0:
                 x, y, distance = self.open_list.pop(0)
                 if distance < self.speed:
-                    self.board.board[y][x].set_reachable_state(self.model.id, True)
+                    self.board.board[y][x].tile.set_reachable_state(self.model.id, True)
                     self.tiles.append((x, y, distance))
                     changed_tiles = True
                     for neighbor, neighbor_distance in self.board.get_neighbors(x, y):
-                        if neighbor.is_walkable:
+                        if neighbor.tile.is_walkable:
                             # check if the neighbor is reachable and  if so update the distance and readd the neighbor to the open list
-                            if neighbor.distance[self.model.id] == None:
-                                neighbor.distance[self.model.id] = distance + neighbor_distance
-                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
-                            elif distance + neighbor_distance < neighbor.distance[self.model.id]:
-                                neighbor.distance[self.model.id] = distance + neighbor_distance
-                                neighbor.edge[self.model.id] = False
-                                self.open_list.append((neighbor.x, neighbor.y, distance + neighbor_distance))
+                            if neighbor.tile.distance[self.model.id] == None:
+                                neighbor.tile.distance[self.model.id] = distance + neighbor_distance
+                                self.open_list.append((neighbor.tile.x, neighbor.tile.y, distance + neighbor_distance))
+                            elif distance + neighbor_distance < neighbor.tile.distance[self.model.id]:
+                                neighbor.tile.distance[self.model.id] = distance + neighbor_distance
+                                neighbor.tile.edge[self.model.id] = False
+                                self.open_list.append((neighbor.tile.x, neighbor.tile.y, distance + neighbor_distance))
                 else:
-                    self.board.board[y][x].edge[self.model.id] = True
+                    self.board.board[y][x].tile.edge[self.model.id] = True
                 if time.time() - start_time > update_time:
                     break
             if len(self.open_list) == 0:
@@ -1114,8 +1370,8 @@ class moving_Pathfinder(Pathfinder):
             return True
 
         for tile in self.tiles:
-            self.board.board[tile[1]][tile[0]].set_reachable_state(self.model.id, True)
-            self.board.board[tile[1]][tile[0]].distance[self.model.id] = tile[2]
+            self.board.board[tile[1]][tile[0]].tile.set_reachable_state(self.model.id, True)
+            self.board.board[tile[1]][tile[0]].tile.distance[self.model.id] = tile[2]
         self.tiles_need_applied = False
         return False
     
@@ -1127,16 +1383,15 @@ class moving_Pathfinder(Pathfinder):
             return True
 
         for tile in self.tiles:
-            self.board.board[tile[1]][tile[0]].set_reachable_state(self.model.id, False)
-            self.board.board[tile[1]][tile[0]].distance[self.model.id] = None
+            self.board.board[tile[1]][tile[0]].tile.set_reachable_state(self.model.id, False)
+            self.board.board[tile[1]][tile[0]].tile.distance[self.model.id] = None
         self.tiles_need_applied = False
         return False
 
 
 
-class Tile:
-    def __init__(self, board: Board ,x: int, y: int, is_walkable: bool, color: tuple[int, int, int, int] = (128, 128, 128, 255)):
-        self.board = board
+class p_Tile:
+    def __init__(self, x: int, y: int, is_walkable: bool):
         self.x = x
         self.y = y
         self.is_walkable = is_walkable
@@ -1144,9 +1399,9 @@ class Tile:
         self.is_visible = {int: bool}
         self.is_any_reachable = False
         self.is_any_visible = False
+        self.updated = True
 
         self.edge = {int: bool}
-        self.color = color
         self.distance = {int : float}
         self.visibility_distance = {int: float}
 
@@ -1159,6 +1414,7 @@ class Tile:
             self.is_any_reachable = True
         elif not any(self.is_reachable.values()):
             self.is_any_reachable = False
+        self.updated = True
     
     def set_visible_state(self, id: int, state: bool):
         self.is_visible[id] = state
@@ -1166,26 +1422,46 @@ class Tile:
             self.is_any_visible = True
         elif not any(self.is_visible.values()):
             self.is_any_visible = False
+        self.updated = True
+
+    
+class p_Tile_wrapper:
+    def __init__(self, tile: p_Tile):
+        self.tile = tile
+
+
+class Tile:
+    def __init__(self, board: Board ,x: int, y: int, is_walkable: bool, color: tuple[int, int, int, int] = (128, 128, 128, 255)):
+        self.board = board
+        self.tile = p_Tile(x, y, is_walkable)
+        self.color = color
+
+    def set_reachable_state(self, id: int, state: bool):
+        self.tile.set_reachable_state(id, state)
+    
+    def set_visible_state(self, id: int, state: bool):
+        self.tile.set_visible_state(id, state)
 
     
 
     
     def update(self, pixels_per_tile):
         # right click to change the walkable status of the tile
-        if self.needs_reset:
-            self.needs_reset = False
-            self.is_any_reachable = False
-            self.is_any_visible = False
-            for key in self.is_reachable:
-                self.is_reachable[key] = False
-            for key in self.is_visible:
-                self.is_visible[key] = False
-            for key in self.distance:
-                self.distance[key] = None
-            for key in self.visibility_distance:
-                self.visibility_distance[key] = None
-            for key in self.edge:
-                self.edge[key] = False
+        if self.tile.needs_reset:
+            self.tile.needs_reset = False
+            self.tile.is_any_reachable = False
+            self.tile.is_any_visible = False
+            for key in self.tile.is_reachable:
+                self.tile.is_reachable[key] = False
+            for key in self.tile.is_visible:
+                self.tile.is_visible[key] = False
+            for key in self.tile.distance:
+                self.tile.distance[key] = None
+            for key in self.tile.visibility_distance:
+                self.tile.visibility_distance[key] = None
+            for key in self.tile.edge:
+                self.tile.edge[key] = False
+            self.updated = True
         
         '''
         if imgui.is_mouse_down(1) and imgui.is_mouse_hovering_rect(imgui.ImVec2(cursor_pos.x + self.x * pixels_per_tile, cursor_pos.y + self.y * pixels_per_tile), imgui.ImVec2(cursor_pos.x + self.x * pixels_per_tile + pixels_per_tile, cursor_pos.y + self.y * pixels_per_tile + pixels_per_tile)):
@@ -1197,15 +1473,15 @@ class Tile:
             self.already_clicked_without_break = False
         '''
         
-        if self.is_walkable:
+        if self.tile.is_walkable:
             # if any value in the is_reachable dictionary is true set the color to blue
             self.color = (0, 0, 0, 0)
-            if self.is_any_reachable:
+            if self.tile.is_any_reachable:
                 self.color = (0, 0, 255, 255)
-                if self.is_any_visible:
+                if self.tile.is_any_visible:
                     self.color = (0, 255, self.color[2], 255)
             else:
-                if self.is_any_visible:
+                if self.tile.is_any_visible:
                     self.color = (0, 255, 0, 255)
                 else:
                     self.color = (128, 128, 128, 255)
@@ -1213,8 +1489,8 @@ class Tile:
         else:
             self.color = (255, 0, 0, 255)
 
-        _x = self.x * pixels_per_tile
-        _y = self.y * pixels_per_tile
+        _x = self.tile.x * pixels_per_tile
+        _y = self.tile.y * pixels_per_tile
 
         # draw the tile in board.ImageRgb if the color is not the same as the current color
         
